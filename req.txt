@@ -1,0 +1,10 @@
+langchain
+langchain-ollama
+langgraph
+tavily-python
+fastapi
+uvicorn
+streamlit
+requests
+python-dotenv
+pydantic
