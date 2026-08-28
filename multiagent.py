@@ -1,20 +1,31 @@
 import os
+import re
 from typing import TypedDict
 from dotenv import load_dotenv
 from tavily import TavilyClient
 
 from langchain.agents import create_agent
 from langchain.tools import tool
+from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, START, END
 
 load_dotenv()
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-MODEL = "openai:gpt-4o-mini"     # swap for whatever is current
-MAX_REVISIONS = 1                # ← the cost guardrail. Do not remove.
+MODEL_NAME = "qwen3.6-16k:latest"
+NUM_CTX = 16384                  
+MAX_REVISIONS = 1             
 
 
-# ---------------- Shared state ----------------
+def make_llm(temperature: float = 0.0) -> ChatOllama:
+    """One place to configure the model — swap here to move to an API later."""
+    return ChatOllama(
+        model=MODEL_NAME,
+        temperature=temperature,
+        num_ctx=NUM_CTX,
+    )
+
+
 class ReportState(TypedDict):
     topic: str
     research: str
@@ -24,7 +35,6 @@ class ReportState(TypedDict):
     revisions: int
 
 
-# ---------------- Tool ----------------
 @tool
 def web_search(query: str) -> str:
     """Search the web for current information on a topic.
@@ -39,9 +49,8 @@ def web_search(query: str) -> str:
     )
 
 
-# ---------------- The three specialists ----------------
 researcher = create_agent(
-    model=MODEL,
+    model=make_llm(),
     tools=[web_search],
     system_prompt=(
         "You are a research specialist. Given a topic, run several targeted "
@@ -53,8 +62,8 @@ researcher = create_agent(
 )
 
 writer = create_agent(
-    model=MODEL,
-    tools=[],   # deliberately no tools: the writer may ONLY use given research
+    model=make_llm(temperature=0.3),
+    tools=[],   
     system_prompt=(
         "You are a report writer. Using ONLY the research notes provided, write "
         "a clear report in markdown with: a title, a 3-sentence executive "
@@ -65,7 +74,7 @@ writer = create_agent(
 )
 
 critic = create_agent(
-    model=MODEL,
+    model=make_llm(),
     tools=[],
     system_prompt=(
         "You are a critical reviewer. Check the draft against the research notes.\n"
@@ -80,7 +89,6 @@ critic = create_agent(
 )
 
 
-# ---------------- Graph nodes ----------------
 def research_node(state: ReportState) -> dict:
     result = researcher.invoke({"messages": [
         {"role": "user", "content": f"Research this topic thoroughly: {state['topic']}"}
@@ -107,11 +115,14 @@ def critique_node(state: ReportState) -> dict:
     )
     result = critic.invoke({"messages": [{"role": "user", "content": prompt}]})
     text = result["messages"][-1].content
-    approved = "APPROVED" in text.upper().split("FEEDBACK")[0]
+
+    match = re.search(r"VERDICT:\s*(\w+)", text, re.IGNORECASE)
+    approved = bool(match) and match.group(1).upper().startswith("APPROVE")
+    if not match:
+        approved = True  
     return {"critique": text, "approved": approved}
 
 
-# ---------------- Routing ----------------
 def should_revise(state: ReportState) -> str:
     # The guardrail: approved OR out of revisions → stop. No exceptions.
     if state["approved"] or state["revisions"] > MAX_REVISIONS:
@@ -119,7 +130,6 @@ def should_revise(state: ReportState) -> str:
     return "revise"
 
 
-# ---------------- Wire the graph ----------------
 builder = StateGraph(ReportState)
 builder.add_node("researcher", research_node)
 builder.add_node("writer", write_node)
@@ -137,7 +147,6 @@ builder.add_conditional_edges(
 graph = builder.compile()
 
 
-# ---------------- Run ----------------
 if __name__ == "__main__":
     initial = {
         "topic": "How Indian startups are adopting generative AI in 2026",
